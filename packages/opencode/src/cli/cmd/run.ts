@@ -895,7 +895,7 @@ export const RunCommand = effectCmd({
             initialInput,
             createSession: createFreshSession,
             thinking,
-            backgroundSubagents: flags.experimentalBackgroundSubagents,
+            backgroundSubagents: true,
             demo: args.demo,
           })
         } catch (error) {
@@ -932,7 +932,7 @@ export const RunCommand = effectCmd({
             files,
             initialInput,
             thinking,
-            backgroundSubagents: flags.experimentalBackgroundSubagents,
+            backgroundSubagents: true,
             demo: args.demo,
           })
         } catch (error) {
