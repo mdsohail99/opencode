@@ -9,9 +9,14 @@ import { Agent } from "../agent/agent"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
-import { Effect, Exit, Schema, Scope } from "effect"
+import { Effect, Exit, Option, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { Database } from "@opencode-ai/core/database/database"
+import { Worktree } from "@/worktree"
+import { InstanceState } from "@/effect/instance-state"
+import { InstanceRef } from "@/effect/instance-ref"
+import type { InstanceContext } from "@/project/instance-context"
+import { errorMessage } from "../util/error"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
@@ -55,6 +60,10 @@ export const Parameters = Schema.Struct({
     description:
       "Run the agent in the background. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress",
   }),
+  worktree: Schema.optional(Schema.Boolean).annotate({
+    description:
+      "Run the subagent in an isolated git worktree under the app data directory. Its edits are auto-committed and, with approval, merged back into the parent branch on completion. Implicit for background tasks when the project is a git repo",
+  }),
 })
 
 export function renderOutput(input: {
@@ -62,17 +71,37 @@ export function renderOutput(input: {
   state: "running" | "completed" | "error" | "cancelled"
   summary?: string
   text: string
+  merge?: { status: string; stat?: string; detail?: string }
 }) {
   const tag = input.state === "error" ? "task_error" : "task_result"
+  const merge = input.merge
+    ? [
+        `<merge status="${input.merge.status}">`,
+        ...(input.merge.stat ? [input.merge.stat] : []),
+        ...(input.merge.detail ? [input.merge.detail] : []),
+        "</merge>",
+      ]
+    : []
   return [
     `<task id="${input.sessionID}" state="${input.state}">`,
     ...(input.summary ? [`<summary>${input.summary}</summary>`] : []),
     `<${tag}>`,
     input.text,
     `</${tag}>`,
+    ...merge,
     "</task>",
   ].join("\n")
 }
+
+/** Active worktree per child session, shared across resume/extend tool calls. */
+interface WorktreeEntry {
+  readonly info: Worktree.Info
+  readonly parentCtx: InstanceContext
+  readonly childCtx: InstanceContext
+  consumed: boolean
+}
+
+const worktrees = new Map<SessionID, WorktreeEntry>()
 
 export const TaskTool = Tool.define(
   id,
@@ -83,15 +112,30 @@ export const TaskTool = Tool.define(
     const sessions = yield* Session.Service
     const scope = yield* Scope.Scope
     const database = yield* Database.Service
+    // Optional backend: the tool must be definable without the worktree
+    // service installed (embedded runtimes, lean test layers). Explicit
+    // isolation fails with a clear error; implied isolation (background)
+    // degrades to running in place with a warning.
+    const worktreeOption = yield* Effect.serviceOption(Worktree.Service)
 
     const run = Effect.fn("TaskTool.execute")(function* (
       params: Schema.Schema.Type<typeof Parameters>,
       ctx: Tool.Context,
     ) {
-      const cfg = yield* config.get()
-      const runInBackground = params.background === true
+      // Foreground explicit worktree: fail cleanly BEFORE any instance-bound
+      // service call (e.g. config.get would defect without an instance).
+      if (params.worktree === true && Option.isNone(Option.fromNullishOr(yield* InstanceRef))) {
+        return yield* Effect.fail(new Error("Worktree mode requires a project instance context"))
+      }
 
-      const parent = yield* sessions.get(ctx.sessionID)
+const cfg = yield* config.get()
+      const runInBackground = params.background === true
+      // Worktree isolation is explicit via `worktree: true`, or implied by
+      // background mode (background output is injected later, so isolation
+      // cannot block the parent; foreground callers opt in explicitly).
+      const useWorktree = params.worktree === true || runInBackground
+
+const parent = yield* sessions.get(ctx.sessionID)
       let current = parent
       let depth = 0
       while (current.parentID) {
@@ -187,6 +231,119 @@ export const TaskTool = Tool.define(
       const ops = ctx.extra?.promptOps as TaskPromptOps
       if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
 
+      // Worktree isolation (spec B): allocate an isolated git worktree before
+      // scheduling whenever requested explicitly or implied by background mode.
+      const worktreeSvc = useWorktree ? Option.getOrNull(worktreeOption) ?? undefined : undefined
+      if (useWorktree && !worktreeSvc) {
+        if (params.worktree === true)
+          return yield* Effect.fail(new Error("Worktree mode requires the worktree service"))
+        yield* Effect.logWarning("Worktree mode unavailable: worktree service not installed; running without isolation")
+      }
+      let worktreeEntry: WorktreeEntry | undefined
+      let mergeResult: Worktree.MergeResult | undefined
+      if (worktreeSvc) {
+        const existing = worktrees.get(nextSession.id)
+        if (existing) {
+          worktreeEntry = existing
+        } else {
+          const parentCtx = Option.fromNullishOr(yield* InstanceRef)
+          if (Option.isNone(parentCtx)) {
+            if (params.worktree === true)
+              return yield* Effect.fail(new Error("Worktree mode requires a project instance context"))
+            yield* Effect.logWarning("Worktree mode unavailable: no project instance; running without isolation")
+          } else {
+            const created = yield* worktreeSvc.create({ name: `ocd-${params.subagent_type}` }).pipe(
+              Effect.match({
+                onSuccess: (info) => ({ ok: true as const, info }),
+                onFailure: (error: unknown) => ({ ok: false as const, error }),
+              }),
+            )
+            if (created.ok) {
+              const childCtx: InstanceContext = {
+                directory: created.info.directory,
+                worktree: created.info.directory,
+                project: parentCtx.value.project,
+              }
+              worktreeEntry = { info: created.info, parentCtx: parentCtx.value, childCtx, consumed: false }
+              worktrees.set(nextSession.id, worktreeEntry)
+            } else if (params.worktree === true) {
+              return yield* Effect.fail(new Error(`Failed to create a subagent worktree:\n${errorMessage(created.error)}`))
+            } else {
+              yield* Effect.logWarning("Subagent worktree unavailable; running without isolation", {
+                error: errorMessage(created.error),
+              })
+            }
+          }
+        }
+      }
+
+      const provideChild = <A, E, R>(entry: WorktreeEntry, effect: Effect.Effect<A, E, R>) =>
+        Effect.provideService(InstanceRef, entry.childCtx)(effect)
+      const provideParent = <A, E, R>(entry: WorktreeEntry, effect: Effect.Effect<A, E, R>) =>
+        Effect.provideService(InstanceRef, entry.parentCtx)(effect)
+
+      // Security gate R3: merge NEVER proceeds without human approval. The diff
+      // preview (stat + changed files) is shown in the permission prompt; deny,
+      // rejection, or a non-interactive environment defaults to no merge.
+      const requestMergeApproval = Effect.fn("TaskTool.requestWorktreeMergeApproval")(function* (preview: {
+        stat: string
+        files: string[]
+      }) {
+        const decision = yield* ctx
+          .ask({
+            permission: "worktree-merge",
+            patterns: ["*"],
+            always: [],
+            metadata: { stat: preview.stat, files: preview.files },
+          })
+          .pipe(
+            Effect.match({ onFailure: () => false, onSuccess: () => true }),
+            Effect.timeoutOption("10 minutes"),
+          )
+        return Option.isSome(decision) ? decision.value : false
+      })
+
+      // Exactly-once completion: the first exit claims the entry — success
+      // merges (inside the parent InstanceRef so the lifecycle targets the
+      // parent checkout), failure/cancel removes the worktree. Later exits
+      // (resume/extend) no-op. Runs under the child InstanceRef so the child's
+      // tools target the worktree checkout.
+      const cleanupWorktree = Effect.fnUntraced(function* (
+        entry: WorktreeEntry,
+        exit: Exit.Exit<string, unknown>,
+      ) {
+        if (entry.consumed) return
+        entry.consumed = true
+        worktrees.delete(nextSession.id)
+        if (!worktreeSvc) return
+        if (!Exit.isSuccess(exit)) {
+          yield* provideParent(entry, worktreeSvc.remove({ directory: entry.info.directory })).pipe(Effect.ignore)
+          return
+        }
+        mergeResult = yield* provideParent(
+          entry,
+          worktreeSvc.mergeAndCleanup(entry.info, {
+            commit: `ocd ${params.subagent_type} #${nextSession.id}`,
+            email: `ocd-subagent-${nextSession.id}@ocd.local`,
+            approve: (preview) => requestMergeApproval(preview),
+          }),
+        ).pipe(
+          Effect.match({
+            onSuccess: (result) => result,
+            onFailure: (error: unknown) => ({ status: "merge_failed" as const, detail: errorMessage(error) }),
+          }),
+        )
+      })
+
+      const wrappedRun = (entry: WorktreeEntry | undefined, run: Effect.Effect<string, unknown>) =>
+        (entry ? provideChild(entry, run) : run).pipe(
+          Effect.onInterrupt(() => ops.cancel(nextSession.id)),
+          Effect.onExit((exit) => (entry ? cleanupWorktree(entry, exit) : Effect.void)),
+        )
+
+      const mergeBlock = () =>
+        mergeResult ? { status: mergeResult.status, stat: mergeResult.stat, detail: mergeResult.detail } : undefined
+
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
         const parts = yield* ops.resolvePromptParts(params.prompt)
         const result = yield* ops.prompt({
@@ -236,6 +393,7 @@ export const TaskTool = Tool.define(
                       ? `Background task completed: ${params.description}`
                       : `Background task failed: ${params.description}`,
                   text,
+                  merge: mergeBlock(),
                 }),
               },
             ],
@@ -254,7 +412,7 @@ export const TaskTool = Tool.define(
         )
       })
 
-      if (yield* background.extend({ id: nextSession.id, run: runTask() })) {
+      if (yield* background.extend({ id: nextSession.id, run: wrappedRun(worktreeEntry, runTask()) })) {
         return {
           title: params.description,
           metadata: {
@@ -283,7 +441,7 @@ export const TaskTool = Tool.define(
           }),
           notify(nextSession.id),
         ]),
-        run: runTask().pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
+        run: wrappedRun(worktreeEntry, runTask()),
       })
 
       function backgroundResult() {
@@ -331,13 +489,29 @@ export const TaskTool = Tool.define(
             return {
               title: params.description,
               metadata,
-              output: renderOutput({ sessionID: nextSession.id, state: "completed", text: result?.output ?? "" }),
+              output: renderOutput({
+                sessionID: nextSession.id,
+                state: "completed",
+                text: result?.output ?? "",
+                merge: mergeBlock(),
+              }),
             }
           }),
         (_, exit) =>
           Effect.gen(function* () {
             if (Exit.hasInterrupts(exit))
               yield* Effect.all([cancel, background.cancel(nextSession.id)], { discard: true })
+            // Foreground caller abandoned the session: drop the worktree
+            // instead of merging. The worktree entry is claimed here so the
+            // child's own onExit cleanup becomes a no-op.
+            const svc = worktreeSvc
+            if (worktreeEntry && !worktreeEntry.consumed && svc) {
+              worktreeEntry.consumed = true
+              worktrees.delete(nextSession.id)
+              yield* provideParent(worktreeEntry, svc.remove({ directory: worktreeEntry.info.directory })).pipe(
+                Effect.ignore,
+              )
+            }
           }).pipe(
             Effect.ensuring(
               Effect.sync(() => {

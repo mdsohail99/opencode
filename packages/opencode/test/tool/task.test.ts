@@ -3,8 +3,9 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Option } from "effect"
 import { Agent } from "../../src/agent/agent"
+import { Account } from "@/account/account"
 import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Config } from "@/config/config"
@@ -20,7 +21,15 @@ import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
-import { disposeAllInstances } from "../fixture/fixture"
+import { InstanceBootstrap } from "../../src/project/bootstrap"
+import { InstanceStore } from "../../src/project/instance-store"
+import { Vcs } from "../../src/project/vcs"
+import { Format } from "../../src/format"
+import { LSP } from "../../src/lsp/lsp"
+import { Project } from "../../src/project/project"
+import { ShareNext } from "../../src/share/share-next"
+import { Snapshot } from "../../src/snapshot"
+import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -28,6 +37,13 @@ import { ModelV2 } from "@opencode-ai/core/model"
 afterEach(async () => {
   await disposeAllInstances()
 })
+
+// Machines that run opencode with an OPENCODE_CONFIG_DIR env var (e.g. an
+// agent-install dir carrying `subagent_depth`) would have that config merged
+// with higher priority than this suite's fixture project files, silently
+// breaking the depth assertions below. Flag reads the env lazily, so
+// clearing it here isolates this suite from that machine-level config.
+delete process.env["OPENCODE_CONFIG_DIR"]
 
 const ref = {
   providerID: ProviderV2.ID.make("test"),
@@ -51,8 +67,22 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
       Database.node,
       RuntimeFlags.node,
       Ripgrep.node,
+      // InstanceBootstrap (replacing InstanceStore.bootstrapNode) declares
+      // Vcs, Format, LSP, Project, ShareNext, Snapshot as deps.
+      Vcs.node,
+      Format.node,
+      LSP.node,
+      Project.node,
+      ShareNext.node,
+      Snapshot.node,
     ]),
-    [[RuntimeFlags.node, RuntimeFlags.layer(flags)]],
+    [
+      [RuntimeFlags.node, RuntimeFlags.layer(flags)],
+      [InstanceStore.bootstrapNode, InstanceBootstrap.node],
+      // No logged-in account: keep Config.loadInstanceState from fetching a
+      // remote account config that would override the fixture's opencode.json.
+      [Account.node, Layer.mock(Account.Service, { active: () => Effect.succeed(Option.none()) })],
+    ],
   )
 
 const it = testEffect(layer())
@@ -504,45 +534,50 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("prevents subagents from launching subagents by default", () =>
-    Effect.gen(function* () {
-      const sessions = yield* Session.Service
-      const { chat, assistant } = yield* seed()
-      const child = yield* sessions.create({ parentID: chat.id, title: "child" })
-      const nestedAssistant = yield* sessions.updateMessage({
-        ...assistant,
-        id: MessageID.ascending(),
-        parentID: MessageID.ascending(),
-        sessionID: child.id,
-      })
-      const tool = yield* TaskTool
-      const def = yield* tool.init()
-      let asked = false
-
-      const exit = yield* def
-        .execute(
-          {
-            description: "inspect bug",
-            prompt: "look into the cache key path",
-            subagent_type: "general",
-          },
-          {
+  it.instance(
+    "prevents subagents from launching subagents by default",
+    () =>
+Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          const { chat, assistant } = yield* seed()
+          const test = yield* TestInstance
+          const child = yield* sessions.create({ parentID: chat.id, title: "child" })
+          const nestedAssistant = yield* sessions.updateMessage({
+            ...assistant,
+            id: MessageID.ascending(),
+            parentID: MessageID.ascending(),
             sessionID: child.id,
-            messageID: nestedAssistant.id,
-            agent: "general",
-            abort: new AbortController().signal,
-            extra: { promptOps: stubOps() },
-            messages: [],
-            metadata: () => Effect.void,
-            ask: () => Effect.sync(() => (asked = true)),
-          },
-        )
-        .pipe(Effect.exit)
+          })
+const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let asked = false
 
-      expect(Exit.isFailure(exit)).toBe(true)
-      expect(asked).toBe(false)
-      expect(yield* sessions.children(child.id)).toHaveLength(0)
-    }),
+          const exit = yield* def
+            .execute(
+              {
+                description: "inspect bug",
+                prompt: "look into the cache key path",
+                subagent_type: "general",
+              },
+              {
+                sessionID: child.id,
+                messageID: nestedAssistant.id,
+                agent: "general",
+                abort: new AbortController().signal,
+                extra: { promptOps: stubOps() },
+                messages: [],
+                metadata: () => Effect.void,
+                ask: () => Effect.sync(() => (asked = true)),
+                ...(test.directory ? { directory: test.directory } : {}),
+              },
+            )
+            .pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(asked).toBe(false)
+        expect(yield* sessions.children(child.id)).toHaveLength(0)
+      }),
+    { config: { subagent_depth: 0 } },
   )
 
   it.instance(
@@ -558,7 +593,7 @@ describe("tool.task", () => {
           parentID: MessageID.ascending(),
           sessionID: child.id,
         })
-        const tool = yield* TaskTool
+const tool = yield* TaskTool
         const def = yield* tool.init()
 
         const result = yield* def.execute(
