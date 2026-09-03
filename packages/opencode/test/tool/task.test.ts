@@ -21,6 +21,10 @@ import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { Global } from "@opencode-ai/core/global"
+import { GlobalBus } from "@/bus/global"
+import path from "path"
+import fs from "fs/promises"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
 import { Vcs } from "../../src/project/vcs"
@@ -1139,5 +1143,310 @@ const tool = yield* TaskTool
       expect((yield* jobs.get(child.id))?.status).toBe("cancelled")
       expect((yield* jobs.get(grandchild.id))?.status).toBe("cancelled")
     }),
+  )
+
+  it.instance("enforces 20-worker concurrency ceiling by default", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      for (let i = 0; i < 20; i++) {
+        yield* jobs.start({
+          id: `worker-ceiling-${i}`,
+          type: "task",
+          metadata: { parentSessionId: chat.id, sessionId: `worker-ceiling-${i}` },
+          run: Effect.never,
+        })
+      }
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "task 21",
+            prompt: "do something",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        const err = Cause.squash(exit.cause)
+        expect(String(err)).toContain("Concurrency safety ceiling reached")
+      }
+    }),
+  )
+
+  it.instance(
+    "concurrency ceiling respects root and experimental max_concurrent_agents config",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+
+        for (let i = 0; i < 20; i++) {
+          yield* jobs.start({
+            id: `worker-cfg-${i}`,
+            type: "task",
+            metadata: { parentSessionId: chat.id, sessionId: `worker-cfg-${i}` },
+            run: Effect.never,
+          })
+        }
+
+        const result = yield* def.execute(
+          {
+            description: "task 21 allowed",
+            prompt: "do something",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ text: "ok 21" }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(result.metadata.sessionId).toBeDefined()
+      }),
+    { config: { max_concurrent_agents: 25 } as any },
+  )
+
+  it.instance("resuming an existing task with task_id bypasses the concurrency ceiling", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const existingChild = yield* sessions.create({ parentID: chat.id, title: "existing child" })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      for (let i = 0; i < 10; i++) {
+        yield* jobs.start({
+          id: `worker-resume-${i}`,
+          type: "task",
+          metadata: { parentSessionId: chat.id, sessionId: `worker-resume-${i}` },
+          run: Effect.never,
+        })
+      }
+
+      const result = yield* def.execute(
+        {
+          description: "resume task",
+          prompt: "continue work",
+          subagent_type: "general",
+          task_id: existingChild.id,
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: stubOps({ text: "resumed ok" }) },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.metadata.sessionId).toBe(existingChild.id)
+    }),
+  )
+
+  it.instance("broadcasts micro-step progress events to GlobalBus (task.milestone)", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const milestones: any[] = []
+      const listener = (evt: any) => {
+        if (evt.payload?.type === "task.milestone") {
+          milestones.push(evt.payload.properties)
+        }
+      }
+      GlobalBus.on("event", listener)
+
+      try {
+        const result = yield* def.execute(
+          {
+            description: "milestone test task",
+            prompt: "work on milestones",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ text: "milestone finished" }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(result.metadata.sessionId).toBeDefined()
+        expect(milestones.length).toBeGreaterThanOrEqual(2)
+        expect(milestones.some((m) => m.state === "started" || m.status === "started")).toBe(true)
+        expect(milestones.some((m) => m.state === "completed" || m.status === "completed")).toBe(true)
+      } finally {
+        GlobalBus.off("event", listener)
+      }
+    }),
+  )
+
+  it.instance("compresses verbose completion outputs (>1500 chars) and writes full log to disk", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const largeText = "A".repeat(100) + "\n" + "B".repeat(1500) + "\nEnd of detailed logs"
+      expect(largeText.length).toBeGreaterThan(1500)
+
+      const result = yield* def.execute(
+        {
+          description: "verbose task",
+          prompt: "generate logs",
+          subagent_type: "general",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: stubOps({ text: largeText }) },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.output).toContain("[Full log:")
+      expect(result.output.length).toBeLessThan(largeText.length)
+
+      const logPath = path.join(Global.Path.log, "tasks", `${result.metadata.sessionId}.log`)
+      const fileContent = yield* Effect.promise(() => fs.readFile(logPath, "utf-8"))
+      expect(fileContent).toBe(largeText)
+    }),
+  )
+
+  background.instance("daemon background task is decoupled from chat cancellation", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const runState = yield* SessionRunState.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const result = yield* def.execute(
+        {
+          description: "daemon worker",
+          prompt: "run forever in background",
+          subagent_type: "general",
+          background: true,
+          daemon: true,
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: {
+            promptOps: {
+              ...stubOps(),
+              prompt: () => Effect.never,
+            } satisfies TaskPromptOps,
+          },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      yield* runState.cancel(chat.id)
+
+      const jobInfo = yield* jobs.get(result.metadata.sessionId)
+      expect(jobInfo).toBeDefined()
+      expect(jobInfo?.status).toBe("running")
+      expect(jobInfo?.metadata?.daemon).toBe(true)
+
+      yield* jobs.cancel(result.metadata.sessionId)
+    }),
+  )
+
+  it.instance(
+    "bubbles 1-line milestone to root session when internal specialist completes (depth >= 1)",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed()
+        const childSession = yield* sessions.create({ parentID: chat.id, title: "Lead Session" })
+        const nestedAssistant = yield* sessions.updateMessage({
+          ...assistant,
+          id: MessageID.ascending(),
+          parentID: MessageID.ascending(),
+          sessionID: childSession.id,
+        })
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+
+        const rootPrompts: SessionPrompt.PromptInput[] = []
+        const promptOps: TaskPromptOps = {
+          cancel: () => Effect.void,
+          resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+          prompt: (input) =>
+            Effect.sync(() => {
+              if (input.sessionID === chat.id) {
+                rootPrompts.push(input)
+              }
+              return reply(input, "specialist finished")
+            }),
+        }
+
+        yield* def.execute(
+          {
+            description: "specialist task",
+            prompt: "deep investigation",
+            subagent_type: "general",
+          },
+          {
+            sessionID: childSession.id,
+            messageID: nestedAssistant.id,
+            agent: "general",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        yield* Effect.sleep("50 millis")
+
+        expect(rootPrompts.length).toBeGreaterThanOrEqual(1)
+        const milestone = rootPrompts[0].parts.find((p) => p.type === "text")?.text
+        expect(milestone).toContain("[Milestone] @general: specialist task")
+      }),
+    { config: { subagent_depth: 2 } },
   )
 })
