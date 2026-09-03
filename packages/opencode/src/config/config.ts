@@ -109,10 +109,13 @@ async function resolveLoadedPlugins<T extends { plugin?: ConfigPluginV1.Spec[] }
   return config
 }
 
-type Info = ConfigV1.Info & {
+export type Info = ConfigV1.Info & {
   // plugin_origins is derived state, not a persisted config field. It keeps each winning plugin spec together
   // with the file and scope it came from so later runtime code can make location-sensitive decisions.
   plugin_origins?: ConfigPlugin.Origin[]
+  experimental?: ConfigV1.Info["experimental"] & {
+    max_concurrent_agents?: number
+  }
 }
 
 type State = {
@@ -195,7 +198,24 @@ const layer = Layer.effect(
           action: diagnostic.message,
         }),
       )
-      return ConfigParse.schema(ConfigV1.Info, result.value, source)
+      const data = ConfigParse.schema(ConfigV1.Info, result.value, source) as Info
+      const raw = result.value as {
+        max_concurrent_agents?: number
+        experimental?: { max_concurrent_agents?: number }
+      }
+      const configuredLimit =
+        typeof raw?.experimental?.max_concurrent_agents === "number"
+          ? raw.experimental.max_concurrent_agents
+          : typeof raw?.max_concurrent_agents === "number"
+            ? raw.max_concurrent_agents
+            : undefined
+      if (typeof configuredLimit === "number") {
+        data.experimental = {
+          ...data.experimental,
+          max_concurrent_agents: configuredLimit,
+        }
+      }
+      return data
     })
 
     const fetchRemoteJson = Effect.fnUntraced(function* <S extends Schema.Top>(
