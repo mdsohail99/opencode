@@ -30,6 +30,10 @@ target
 opencode-dev
 UPCOMING_CHANGELOG.md
 UPSTREAM_WORKFLOW.md
+PROJECT.md
+TEST_INFRA.md
+ORIGINAL_REQUEST.md
 logs/
 *.bun-build
 tsconfig.tsbuildinfo
+.agents/

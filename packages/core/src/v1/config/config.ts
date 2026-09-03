@@ -84,6 +84,9 @@ export const Info = Schema.Struct({
   subagent_depth: Schema.optional(NonNegativeInt).annotate({
     description: "Maximum subagent nesting depth. Defaults to 1, which prevents subagents from launching subagents.",
   }),
+  max_concurrent_agents: Schema.optional(PositiveInt).annotate({
+    description: "Maximum concurrent active agents. Defaults to 20.",
+  }),
   username: Schema.optional(Schema.String).annotate({
     description: "Custom username to display in conversations instead of system username",
   }),

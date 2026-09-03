@@ -425,6 +425,7 @@ export interface Interface {
   readonly fork: (input: { sessionID: SessionID; messageID?: MessageID }) => Effect.Effect<Info, NotFound>
   readonly touch: (sessionID: SessionID) => Effect.Effect<void>
   readonly get: (id: SessionID) => Effect.Effect<Info, NotFound>
+  readonly update: (sessionID: SessionID, patch: Patch) => Effect.Effect<void>
   readonly setTitle: (input: { sessionID: SessionID; title: string }) => Effect.Effect<void>
   readonly setArchived: (input: { sessionID: SessionID; time?: number }) => Effect.Effect<void>
   readonly setMetadata: (input: typeof SetMetadataInput.Type) => Effect.Effect<void>
@@ -746,6 +747,10 @@ const layer: Layer.Layer<
         yield* events.publish(SessionV1.Event.Updated, { sessionID, info: next })
       })
 
+    const update = Effect.fn("Session.update")(function* (sessionID: SessionID, patchInfo: Patch) {
+      yield* patch(sessionID, patchInfo).pipe(Effect.orDie)
+    })
+
     const touch = Effect.fn("Session.touch")(function* (sessionID: SessionID) {
       yield* patch(sessionID, { time: { updated: Date.now() } }).pipe(Effect.orDie)
     })
@@ -910,6 +915,7 @@ const layer: Layer.Layer<
       fork,
       touch,
       get,
+      update,
       setTitle,
       setArchived,
       setMetadata,
@@ -943,6 +949,7 @@ const cancelBackgroundJobs = Effect.fn("Session.cancelBackgroundJobs")(function*
   yield* Effect.forEach(
     jobs.filter((job) => {
       if (job.status !== "running") return false
+      if (job.metadata?.daemon === true) return false
       if (job.id === sessionID) return true
       if (job.metadata?.sessionId === sessionID) return true
       return job.metadata?.parentSessionId === sessionID

@@ -280,4 +280,142 @@ describe("tool.task worktree hookup (spec B/E)", () => {
         expect(Exit.isFailure(exit)).toBe(true)
       }),
   )
+
+  background.instance(
+    "read-only agent bypasses worktree creation even in background mode",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const ctx = yield* InstanceState.context
+        const root = path.join(Global.Path.data, "worktree", ctx.project.id)
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+
+        const result = yield* def.execute(
+          {
+            description: "explore codebase",
+            prompt: "find files",
+            subagent_type: "explore",
+            background: true,
+          },
+          taskCtx(chat.id, assistant.id, stubOps({ text: "explore done" })),
+        )
+
+        const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 2_000 })
+        expect(waited.timedOut).toBe(false)
+        expect(waited.info?.status).toBe("completed")
+        expect(waited.info?.output).toBe("explore done")
+
+        expect(yield* exists(root)).toBe(false)
+      }),
+    { git: true },
+  )
+
+  background.instance(
+    "explicit worktree: false bypasses worktree creation even in background mode",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const ctx = yield* InstanceState.context
+        const root = path.join(Global.Path.data, "worktree", ctx.project.id)
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+
+        const result = yield* def.execute(
+          {
+            ...baseTaskParams,
+            background: true,
+            worktree: false,
+          },
+          taskCtx(chat.id, assistant.id, stubOps({ text: "in-place done" })),
+        )
+
+        const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 2_000 })
+        expect(waited.timedOut).toBe(false)
+        expect(waited.info?.status).toBe("completed")
+        expect(waited.info?.output).toBe("in-place done")
+
+        expect(yield* exists(root)).toBe(false)
+      }),
+    { git: true },
+  )
+
+  background.instance(
+    "child worktree merge auto-approves without prompting when autoApprove is true",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+
+        let askedMerge = false
+        const customCtx = {
+          ...taskCtx(chat.id, assistant.id, stubOps({ text: "child done" })),
+          ask: (req: any) => {
+            if (req.permission === "worktree-merge") askedMerge = true
+            return Effect.void
+          },
+        }
+
+        const result = yield* def.execute(
+          {
+            ...baseTaskParams,
+            background: true,
+            autoApprove: true,
+          },
+          customCtx,
+        )
+
+        const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 2_000 })
+        expect(waited.timedOut).toBe(false)
+        expect(waited.info?.status).toBe("completed")
+        expect(askedMerge).toBe(false)
+      }),
+    { git: true },
+  )
+
+  background.instance(
+    "nested child worktree (depth > 0) auto-approves merge without prompting",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed()
+        const childSession = yield* sessions.create({ parentID: chat.id, title: "Lead Session" })
+        const nestedAssistant = yield* sessions.updateMessage({
+          ...assistant,
+          id: MessageID.ascending(),
+          parentID: MessageID.ascending(),
+          sessionID: childSession.id,
+        })
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+
+        let askedMerge = false
+        const customCtx = {
+          ...taskCtx(childSession.id, nestedAssistant.id, stubOps({ text: "nested done" })),
+          ask: (req: any) => {
+            if (req.permission === "worktree-merge") askedMerge = true
+            return Effect.void
+          },
+        }
+
+        const result = yield* def.execute(
+          {
+            ...baseTaskParams,
+            background: true,
+          },
+          customCtx,
+        )
+
+        const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 2_000 })
+        expect(waited.timedOut).toBe(false)
+        expect(waited.info?.status).toBe("completed")
+        expect(askedMerge).toBe(false)
+      }),
+    { git: true, config: { subagent_depth: 2 } },
+  )
 })

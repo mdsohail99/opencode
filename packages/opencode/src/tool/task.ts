@@ -17,6 +17,11 @@ import { InstanceState } from "@/effect/instance-state"
 import { InstanceRef } from "@/effect/instance-ref"
 import type { InstanceContext } from "@/project/instance-context"
 import { errorMessage } from "../util/error"
+import { Global } from "@opencode-ai/core/global"
+import path from "path"
+import fs from "fs"
+import { Permission } from "@/permission"
+import { GlobalBus } from "@/bus/global"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
@@ -64,7 +69,34 @@ export const Parameters = Schema.Struct({
     description:
       "Run the subagent in an isolated git worktree under the app data directory. Its edits are auto-committed and, with approval, merged back into the parent branch on completion. Implicit for background tasks when the project is a git repo",
   }),
+  daemon: Schema.optional(Schema.Boolean).annotate({
+    description: "Run the background task as a daemon decoupled from terminal chat ESC cancellation.",
+  }),
+  autoApprove: Schema.optional(Schema.Boolean).annotate({
+    description: "Automatically approve merging the worktree on completion without prompting for user confirmation.",
+  }),
 })
+
+export const WRITE_PERMISSIONS = [
+  "edit",
+  "write",
+  "write_to_file",
+  "replace_file_content",
+  "apply_patch",
+] as const
+
+export function isReadOnlyAgent(subagent: Agent.Info): boolean {
+  const hasAllowedWrite = subagent.permission.some(
+    (rule) =>
+      WRITE_PERMISSIONS.includes(rule.permission as (typeof WRITE_PERMISSIONS)[number]) &&
+      rule.action !== "deny",
+  )
+  if (hasAllowedWrite) return false
+
+  return WRITE_PERMISSIONS.every(
+    (perm) => Permission.evaluate(perm, "*", subagent.permission).action === "deny",
+  )
+}
 
 export function renderOutput(input: {
   sessionID: string
@@ -73,6 +105,24 @@ export function renderOutput(input: {
   text: string
   merge?: { status: string; stat?: string; detail?: string }
 }) {
+  let text = input.text
+  if (text.length > 1500) {
+    const tasksDir = path.join(Global.Path.log, "tasks")
+    try {
+      fs.mkdirSync(tasksDir, { recursive: true })
+      const logPath = path.join(tasksDir, `${input.sessionID}.log`)
+      fs.writeFileSync(logPath, text, "utf-8")
+      const abstract = text.slice(0, 200).trim()
+      const parts = [
+        abstract + "...",
+        ...(input.merge?.stat ? [input.merge.stat] : []),
+        `[Full log: ${logPath}]`,
+      ]
+      text = parts.join("\n\n")
+    } catch {
+      // Fallback if log directory write fails
+    }
+  }
   const tag = input.state === "error" ? "task_error" : "task_result"
   const merge = input.merge
     ? [
@@ -86,7 +136,7 @@ export function renderOutput(input: {
     `<task id="${input.sessionID}" state="${input.state}">`,
     ...(input.summary ? [`<summary>${input.summary}</summary>`] : []),
     `<${tag}>`,
-    input.text,
+    text,
     `</${tag}>`,
     ...merge,
     "</task>",
@@ -127,27 +177,36 @@ export const TaskTool = Tool.define(
       if (params.worktree === true && Option.isNone(Option.fromNullishOr(yield* InstanceRef))) {
         return yield* Effect.fail(new Error("Worktree mode requires a project instance context"))
       }
-
-const cfg = yield* config.get()
+      const cfg = yield* config.get()
       const runInBackground = params.background === true
-      // Worktree isolation is explicit via `worktree: true`, or implied by
-      // background mode (background output is injected later, so isolation
-      // cannot block the parent; foreground callers opt in explicitly).
-      const useWorktree = params.worktree === true || runInBackground
 
-const parent = yield* sessions.get(ctx.sessionID)
+      const parent = yield* sessions.get(ctx.sessionID)
       let current = parent
       let depth = 0
       while (current.parentID) {
         depth++
         current = yield* sessions.get(current.parentID)
       }
+      const rootSession = current
+
       if (depth >= (cfg.subagent_depth ?? 1)) {
         return yield* Effect.fail(
           new Error(
             `Subagent depth limit reached (${cfg.subagent_depth ?? 1}). Increase "subagent_depth" to allow nested subagents.`,
           ),
         )
+      }
+
+      if (!params.task_id) {
+        const runningJobs = (yield* background.list()).filter((j) => j.status === "running")
+        const maxConcurrent = cfg.max_concurrent_agents ?? cfg.experimental?.max_concurrent_agents ?? 20
+        if (runningJobs.length >= maxConcurrent) {
+          return yield* Effect.fail(
+            new Error(
+              `Concurrency safety ceiling reached: ${runningJobs.length}/${maxConcurrent} active agents running. Wait for existing tasks to complete or adjust max_concurrent_agents.`,
+            ),
+          )
+        }
       }
 
       if (!ctx.extra?.bypassAgentCheck) {
@@ -166,6 +225,9 @@ const parent = yield* sessions.get(ctx.sessionID)
       if (!next) {
         return yield* Effect.fail(new Error(`Unknown agent type: ${params.subagent_type} is not a valid agent type`))
       }
+
+      const isReadOnly = isReadOnlyAgent(next)
+      const useWorktree = !isReadOnly && params.worktree !== false && (params.worktree === true || runInBackground)
 
       const session = params.task_id
         ? yield* sessions.get(SessionID.make(params.task_id)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
@@ -221,6 +283,7 @@ const parent = yield* sessions.get(ctx.sessionID)
         sessionId: nextSession.id,
         model,
         ...(runInBackground ? { background: true } : {}),
+        daemon: params.daemon === true,
       }
 
       yield* ctx.metadata({
@@ -325,7 +388,10 @@ const parent = yield* sessions.get(ctx.sessionID)
           worktreeSvc.mergeAndCleanup(entry.info, {
             commit: `ocd ${params.subagent_type} #${nextSession.id}`,
             email: `ocd-subagent-${nextSession.id}@ocd.local`,
-            approve: (preview) => requestMergeApproval(preview),
+            approve:
+              depth > 0 || params.autoApprove === true
+                ? () => Effect.succeed(true)
+                : (preview) => requestMergeApproval(preview),
           }),
         ).pipe(
           Effect.match({
@@ -371,10 +437,49 @@ const parent = yield* sessions.get(ctx.sessionID)
         return result.parts.findLast((item) => item.type === "text")?.text ?? ""
       })
 
+      const emitMilestone = (state: "started" | "running" | "completed" | "error") => {
+        GlobalBus.emit("event", {
+          payload: {
+            type: "task.milestone",
+            properties: {
+              sessionID: nextSession.id,
+              parentSessionID: ctx.sessionID,
+              status: state,
+              state,
+              agent: next.name,
+              description: params.description,
+            },
+          },
+        })
+      }
+
+      const bubbleMilestoneToRoot = (state: "completed" | "error") => {
+        if (depth >= 1 && rootSession.id !== ctx.sessionID) {
+          const milestoneLine = `[Milestone] @${next.name}: ${params.description} (${state})`
+          return ops
+            .prompt({
+              sessionID: rootSession.id,
+              agent: rootSession.agent ?? ctx.agent,
+              variant,
+              parts: [
+                {
+                  type: "text",
+                  synthetic: true,
+                  text: milestoneLine,
+                },
+              ],
+            })
+            .pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
+        }
+        return Effect.void
+      }
+
       const inject = Effect.fn("TaskTool.injectBackgroundResult")(function* (
         state: "completed" | "error",
         text: string,
       ) {
+        emitMilestone(state)
+        yield* bubbleMilestoneToRoot(state)
         const currentParent = yield* sessions.get(ctx.sessionID)
         yield* ops
           .prompt({
@@ -413,6 +518,7 @@ const parent = yield* sessions.get(ctx.sessionID)
       })
 
       if (yield* background.extend({ id: nextSession.id, run: wrappedRun(worktreeEntry, runTask()) })) {
+        emitMilestone("running")
         return {
           title: params.description,
           metadata: {
@@ -443,6 +549,7 @@ const parent = yield* sessions.get(ctx.sessionID)
         ]),
         run: wrappedRun(worktreeEntry, runTask()),
       })
+      emitMilestone("started")
 
       function backgroundResult() {
         return {
@@ -484,8 +591,18 @@ const parent = yield* sessions.get(ctx.sessionID)
               background.waitForPromotion(nextSession.id),
             )
             if (result?.metadata?.background === true) return backgroundResult()
-            if (result?.status === "error") return yield* Effect.fail(new Error(result.error ?? "Task failed"))
-            if (result?.status === "cancelled") return yield* Effect.fail(new Error("Task cancelled"))
+            if (result?.status === "error") {
+              emitMilestone("error")
+              yield* bubbleMilestoneToRoot("error")
+              return yield* Effect.fail(new Error(result.error ?? "Task failed"))
+            }
+            if (result?.status === "cancelled") {
+              emitMilestone("error")
+              yield* bubbleMilestoneToRoot("error")
+              return yield* Effect.fail(new Error("Task cancelled"))
+            }
+            emitMilestone("completed")
+            yield* bubbleMilestoneToRoot("completed")
             return {
               title: params.description,
               metadata,
