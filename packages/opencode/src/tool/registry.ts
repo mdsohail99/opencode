@@ -10,7 +10,7 @@ import { GlobTool } from "./glob"
 import { GrepTool } from "./grep"
 import { ReadTool } from "./read"
 import { TaskTool } from "./task"
-import { NextAgentTool, AgentsStatusTool } from "./task-teams"
+import { NextAgentTool, AgentsStatusTool, ManageAgentsTool, AskAgentTool } from "./task-teams"
 import { Database } from "@opencode-ai/core/database/database"
 import { TodoWriteTool } from "./todo"
 import { WebFetchTool } from "./webfetch"
@@ -103,6 +103,8 @@ const layer = Layer.effect(
     const task = yield* TaskTool
     const nextagent = yield* NextAgentTool
     const agentsstatus = yield* AgentsStatusTool
+    const manageagents = yield* ManageAgentsTool
+    const askagent = yield* AskAgentTool
     const read = yield* ReadTool
     const question = yield* QuestionTool
     const todo = yield* TodoWriteTool
@@ -220,6 +222,8 @@ const layer = Layer.effect(
           task: Tool.init(task),
           nextagent: Tool.init(nextagent),
           agentsstatus: Tool.init(agentsstatus),
+          manage_agents: Tool.init(manageagents),
+          ask_agent: Tool.init(askagent),
           fetch: Tool.init(webfetch),
           todo: Tool.init(todo),
           search: Tool.init(websearch),
@@ -245,6 +249,8 @@ const layer = Layer.effect(
             tool.task,
             tool.nextagent,
             tool.agentsstatus,
+            tool.manage_agents,
+            tool.ask_agent,
             tool.fetch,
             tool.todo,
             tool.search,
