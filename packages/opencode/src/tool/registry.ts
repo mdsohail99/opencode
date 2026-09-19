@@ -11,6 +11,7 @@ import { GrepTool } from "./grep"
 import { ReadTool } from "./read"
 import { TaskTool } from "./task"
 import { NextAgentTool, AgentsStatusTool, ManageAgentsTool, AskAgentTool } from "./task-teams"
+import { Worktree } from "@/worktree"
 import { Database } from "@opencode-ai/core/database/database"
 import { TodoWriteTool } from "./todo"
 import { WebFetchTool } from "./webfetch"
@@ -462,6 +463,7 @@ export const node = LayerNode.make({
     MCP.node,
     Database.node,
     Ripgrep.node,
+    Worktree.node,
   ],
 })
 
