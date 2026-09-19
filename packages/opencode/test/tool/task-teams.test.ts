@@ -870,6 +870,71 @@ describe("tool.task-teams", () => {
         expect(askRes.metadata.target_id).toBe(workerSession.id)
       }),
     )
+
+    it.instance("resolves pure agent persona without running background session", () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const askTool = yield* AskAgentTool
+        const askDef = yield* askTool.init()
+        let receivedTools: Record<string, boolean> | undefined
+        let receivedSessionID: SessionID | undefined
+        const promptOps: TaskPromptOps = {
+          cancel: () => Effect.void,
+          resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+          prompt: (input) =>
+            Effect.sync(() => {
+              receivedTools = input.tools
+              receivedSessionID = input.sessionID
+              return reply(input, "Exploration answer.")
+            }),
+        }
+
+        const res = yield* askDef.execute(
+          { target_id: "explore", prompt: "What files exist?" },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "general",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(res.output).toBe("Exploration answer.")
+        expect(res.metadata.target_id).toBe("explore")
+        expect(receivedTools).toEqual({ "*": false })
+        expect(receivedSessionID).toBeDefined()
+      }),
+    )
+
+    it.instance("returns graceful error result when target agent is not found", () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const askTool = yield* AskAgentTool
+        const askDef = yield* askTool.init()
+        const promptOps = stubOps()
+
+        const res = yield* askDef.execute(
+          { target_id: "nonexistent_worker_xyz", prompt: "Hello?" },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "general",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(res.title).toBe("ask_agent error")
+        expect(res.output).toContain("Target agent or session 'nonexistent_worker_xyz' not found")
+      }),
+    )
   })
 
   describe("tool registry", () => {
@@ -882,6 +947,15 @@ describe("tool.task-teams", () => {
         expect(ids).toContain("ask_agent")
         expect(ids).toContain("next_agent")
         expect(ids).toContain("agents_status")
+      }),
+    )
+
+    it.instance("provides Worktree.node dependency in ToolRegistry layer", () =>
+      Effect.gen(function* () {
+        const registry = yield* ToolRegistry.Service
+        const { task } = yield* registry.named()
+        expect(task).toBeDefined()
+        expect(task.id).toBe("task")
       }),
     )
   })

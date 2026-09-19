@@ -296,7 +296,10 @@ export const TaskTool = Tool.define(
 
       // Worktree isolation (spec B): allocate an isolated git worktree before
       // scheduling whenever requested explicitly or implied by background mode.
-      const worktreeSvc = useWorktree ? Option.getOrNull(worktreeOption) ?? undefined : undefined
+      const runtimeWorktree = yield* Effect.serviceOption(Worktree.Service)
+      const worktreeSvc = useWorktree
+        ? Option.getOrNull(worktreeOption) ?? Option.getOrNull(runtimeWorktree) ?? undefined
+        : undefined
       if (useWorktree && !worktreeSvc) {
         if (params.worktree === true)
           return yield* Effect.fail(new Error("Worktree mode requires the worktree service"))
