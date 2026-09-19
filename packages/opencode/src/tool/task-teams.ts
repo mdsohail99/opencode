@@ -1,9 +1,14 @@
-import { Clock, Effect, Option, Schema } from "effect"
+import { Clock, Effect, Exit, Option, Schema } from "effect"
 import { Tool } from "./tool"
 import { BackgroundJob } from "@/background/job"
 import { Session } from "../session/session"
+import { Agent } from "@/agent/agent"
 import { renderOutput, type TaskPromptOps } from "./task"
 import type { SessionID } from "../session/schema"
+import { errorMessage } from "../util/error"
+import type { SessionV1 } from "@opencode-ai/core/v1/session"
+import type { ModelV2 } from "@opencode-ai/core/model"
+import type { ProviderV2 } from "@opencode-ai/core/provider"
 
 /** Jobs already handed back by next_agent. Process-local, matching the registry. */
 const drained = new Set<string>()
@@ -62,6 +67,11 @@ export const AskAgentParameters = Schema.Struct({
     description: "Question or prompt for the agent.",
   }),
 })
+
+export interface AskAgentMetadata {
+  target_id?: string
+  ephemeral_id?: string
+}
 
 function own(job: BackgroundJob.Info, sessionID: SessionID) {
   return job.metadata?.background === true && job.metadata?.parentSessionId === sessionID
@@ -313,12 +323,20 @@ export const AgentsStatusTool = Tool.define(
   }),
 )
 
+interface ResolvedTarget {
+  id: string
+  job?: BackgroundJob.Info
+  session?: Session.Info
+  agentInfo?: Agent.Info
+}
+
 const resolveTarget = (
   target: string,
   allJobs: BackgroundJob.Info[],
   sessions: Session.Interface,
+  agents: Agent.Interface,
   parentID?: string,
-) =>
+): Effect.Effect<ResolvedTarget | undefined> =>
   Effect.gen(function* () {
     const directJob = allJobs.find((j) => j.id === target)
     const directSession = yield* sessions.get(target as SessionID).pipe(Effect.option)
@@ -372,6 +390,17 @@ const resolveTarget = (
       }
     }
 
+    const agentList = yield* agents.list().pipe(Effect.orElseSucceed(() => []))
+    const matchingAgent =
+      agentList.find((a) => a.name.toLowerCase() === query) ??
+      agentList.find((a) => a.name.toLowerCase().includes(query))
+    if (matchingAgent) {
+      return {
+        id: matchingAgent.name,
+        agentInfo: matchingAgent,
+      }
+    }
+
     return undefined
   })
 
@@ -380,6 +409,7 @@ export const ManageAgentsTool = Tool.define(
   Effect.gen(function* () {
     const background = yield* BackgroundJob.Service
     const sessions = yield* Session.Service
+    const agents = yield* Agent.Service
 
     const run = Effect.fn("ManageAgentsTool.execute")(function* (
       params: Schema.Schema.Type<typeof ManageAgentsParameters>,
@@ -389,7 +419,7 @@ export const ManageAgentsTool = Tool.define(
       const allJobs = yield* background.list()
       const now = yield* Clock.currentTimeMillis
       const resolved = params.target_id
-        ? yield* resolveTarget(params.target_id, allJobs, sessions, ctx.sessionID)
+        ? yield* resolveTarget(params.target_id, allJobs, sessions, agents, ctx.sessionID)
         : undefined
       const targetId = resolved?.id ?? params.target_id
 
@@ -464,6 +494,20 @@ export const ManageAgentsTool = Tool.define(
           (yield* sessions.get(targetId as SessionID).pipe(Effect.option).pipe(Effect.map(Option.getOrUndefined)))
 
         if (!job && !session) {
+          if (resolved?.agentInfo) {
+            const a = resolved.agentInfo
+            return {
+              title: `Inspect: ${targetId}`,
+              metadata: {},
+              output: [
+                `### Agent Persona: ${a.name}`,
+                `- **Description**: ${a.description ?? "none"}`,
+                `- **Mode**: ${a.mode}`,
+                `- **Model**: ${a.model ? `${a.model.providerID}/${a.model.modelID}` : "default"}`,
+                `- **Native**: ${a.native ? "true" : "false"}`,
+              ].join("\n"),
+            }
+          }
           return {
             title: "Agent not found",
             metadata: {},
@@ -578,65 +622,118 @@ export const AskAgentTool = Tool.define(
   Effect.gen(function* () {
     const background = yield* BackgroundJob.Service
     const sessions = yield* Session.Service
+    const agents = yield* Agent.Service
 
     const run = Effect.fn("AskAgentTool.execute")(function* (
       params: Schema.Schema.Type<typeof AskAgentParameters>,
       ctx: Tool.Context,
     ) {
       const allJobs = yield* background.list()
-      const resolved = yield* resolveTarget(params.target_id, allJobs, sessions, ctx.sessionID)
-      const targetId = resolved?.id ?? params.target_id
+      const resolved = yield* resolveTarget(params.target_id, allJobs, sessions, agents, ctx.sessionID)
+      if (!resolved) {
+        return {
+          title: "ask_agent error",
+          metadata: { target_id: params.target_id },
+          output: `Error: Target agent or session '${params.target_id}' not found. Use agents_status to check running agents or specify a known agent persona (e.g. 'general', 'explore').`,
+        }
+      }
+
+      const targetId = resolved.id
       const targetSession =
-        resolved?.session ??
+        resolved.session ??
         (yield* sessions.get(targetId as SessionID).pipe(Effect.option).pipe(Effect.map(Option.getOrUndefined)))
 
-      if (!targetSession) {
-        return yield* Effect.fail(new Error(`Target agent or session '${params.target_id}' not found`))
-      }
       const ops = ctx.extra?.promptOps as TaskPromptOps | undefined
       if (!ops) {
-        return yield* Effect.fail(new Error("AskAgentTool requires promptOps in ctx.extra"))
+        return {
+          title: "ask_agent error",
+          metadata: { target_id: targetId },
+          output: "Error: ask_agent requires promptOps in execution context.",
+        }
       }
 
+      const agentName = targetSession?.agent ?? resolved.agentInfo?.name ?? targetId
       const ephemeral = yield* sessions.create({
-        parentID: targetSession.id,
-        title: `[Ephemeral Side-Query] ${targetSession.title ?? targetId}`,
-        agent: targetSession.agent,
-        model: targetSession.model,
-        workspaceID: targetSession.workspaceID,
+        parentID: targetSession?.id ?? ctx.sessionID,
+        title: `[Ephemeral Side-Query] ${targetSession?.title ?? agentName}`,
+        agent: agentName,
+        model: targetSession?.model,
+        workspaceID: targetSession?.workspaceID,
+        permission: [{ permission: "*", pattern: "*", action: "deny" }],
       })
 
       return yield* Effect.gen(function* () {
-        const msgs = yield* sessions.messages({ sessionID: targetSession.id, limit: 10 }).pipe(Effect.option)
         let contextPrefix = ""
-        if (Option.isSome(msgs) && msgs.value.length > 0) {
-          const history = msgs.value
-            .flatMap((m) => m.parts.filter((p) => p.type === "text").map((p) => `${m.info.role}: ${preview(p.text)}`))
-            .slice(-5)
-            .join("\n")
-          if (history) {
-            contextPrefix = `[Context from target agent ${targetSession.agent ?? targetId}]:\n${history}\n\n`
+        if (targetSession) {
+          const msgs = yield* sessions.messages({ sessionID: targetSession.id, limit: 10 }).pipe(Effect.option)
+          if (Option.isSome(msgs) && msgs.value.length > 0) {
+            const history = msgs.value
+              .flatMap((m) => m.parts.filter((p) => p.type === "text").map((p) => `${m.info.role}: ${preview(p.text)}`))
+              .slice(-5)
+              .join("\n")
+            if (history) {
+              contextPrefix = `[Context from target agent ${targetSession.agent ?? targetId}]:\n${history}\n\n`
+            }
           }
         }
 
-        const fullPrompt = `${contextPrefix}[Side-Query]: ${params.prompt}`
+        const sideQuestionReminder = `<system-reminder>
+This is a side question from the user. You MUST answer directly in a single response.
+Your tools are disabled. You cannot read files, write files, run commands, search, or take any actions.
+You must complete your response in a single turn with no follow-up turns.
+Only use information already in the conversation context or your own knowledge.
+Never promise to take action or say "let me check...". Do not write simulated tool calls or tool output blocks as text.
+If answering requires reading files or executing commands, state that it cannot be checked from a side question and suggest asking in the main conversation.
+</system-reminder>`
+
+        const fullPrompt = `${sideQuestionReminder}\n\n${contextPrefix}[Side-Question]: ${params.prompt}`
         const parts = yield* ops.resolvePromptParts(fullPrompt)
-        const promptModel = targetSession.model
+
+        let promptModel: { modelID: ModelV2.ID; providerID: ProviderV2.ID } | undefined = targetSession?.model
           ? {
               modelID: targetSession.model.id,
               providerID: targetSession.model.providerID,
             }
-          : undefined
+          : resolved.agentInfo?.model
+            ? {
+                modelID: resolved.agentInfo.model.modelID,
+                providerID: resolved.agentInfo.model.providerID,
+              }
+            : undefined
 
-        const result = yield* ops.prompt({
-          sessionID: ephemeral.id,
-          agent: targetSession.agent,
-          model: promptModel,
-          parts,
-        })
-        const answer = result.parts.findLast((p) => p.type === "text")?.text ?? ""
+        if (!promptModel && targetSession) {
+          const msgs = yield* sessions.messages({ sessionID: targetSession.id, limit: 5 }).pipe(Effect.option)
+          if (Option.isSome(msgs)) {
+            for (const m of msgs.value) {
+              if (m.info.role === "assistant") {
+                const asst = m.info as SessionV1.Assistant
+                if (asst.modelID && asst.providerID) {
+                  promptModel = { modelID: asst.modelID, providerID: asst.providerID }
+                  break
+                }
+              }
+            }
+          }
+        }
+
+        const promptExit = yield* Effect.exit(
+          ops.prompt({
+            sessionID: ephemeral.id,
+            agent: agentName,
+            model: promptModel,
+            tools: { "*": false },
+            parts,
+          }),
+        )
+
+        const answer = Exit.isSuccess(promptExit)
+          ? promptExit.value.parts
+              .flatMap((p: SessionV1.Part) => (p.type === "text" ? [p.text] : []))
+              .join("\n\n") || "No response received."
+          : `[Side-query failed: ${errorMessage(promptExit.cause)}]`
+
         return {
-          title: `Answer from ${targetSession.agent ?? targetId}`,
+          title: `Answer from ${agentName}`,
           metadata: { target_id: targetId, ephemeral_id: ephemeral.id },
           output: answer,
         }
