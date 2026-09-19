@@ -69,11 +69,18 @@ const layer = Layer.effect(
       environment: Effect.fn("SystemPrompt.environment")(function* (model: Provider.Model) {
         const ctx = yield* InstanceState.context
         const references = yield* Effect.gen(function* () {
-          return (yield* (yield* Reference.Service).list()).filter((reference) => reference.description !== undefined)
-        }).pipe(Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(ctx.directory) }))))
+          return (yield* (yield* Reference.Service).list()).filter((reference) => reference?.description !== undefined)
+        }).pipe(
+          Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(ctx.directory) }))),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("failed to resolve project references", { cause }).pipe(Effect.as([])),
+          ),
+        )
+        const modelName = model?.api?.id ?? model?.id ?? "default"
+        const modelID = `${model?.providerID ?? "unknown"}/${modelName}`
         return [
           [
-            `You are powered by the model named ${model.api.id}. The exact model ID is ${model.providerID}/${model.api.id}`,
+            `You are powered by the model named ${modelName}. The exact model ID is ${modelID}`,
             `Here is some useful information about the environment you are running in:`,
             `<env>`,
             `  Working directory: ${ctx.directory}`,
@@ -89,7 +96,8 @@ const layer = Layer.effect(
                 "Project references provide additional directories that can be accessed when relevant.",
                 "<available_references>",
                 ...references
-                  .toSorted((a, b) => a.name.localeCompare(b.name))
+                  .filter((reference) => Boolean(reference && reference.name))
+                  .toSorted((a, b) => (a?.name ?? "").localeCompare(b?.name ?? ""))
                   .flatMap((reference) => [
                     "  <reference>",
                     `    <name>${reference.name}</name>`,
