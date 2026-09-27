@@ -31,10 +31,13 @@ const AGENTS_STATUS_DESCRIPTION = [
 
 const MANAGE_AGENTS_DESCRIPTION = [
   "Manage subagent swarm lifecycle: kill, kill_all, inspect, or restart background workers.",
+  "Use action: 'restart' with a prompt to steer or redirect an active worker mid-flight with new instructions.",
 ].join(" ")
 
 const ASK_AGENT_DESCRIPTION = [
-  "Query an agent out-of-band without interrupting its running task or causing concurrency collisions.",
+  "READ-ONLY inspection and Q&A with an agent out-of-band without interrupting its running task.",
+  "Tools are disabled and this does NOT steer, redirect, or alter running background workers.",
+  "To change instructions or steer an already-running worker mid-flight, use manage_agents with action: 'restart' and your new prompt.",
 ].join(" ")
 
 export const Parameters = Schema.Struct({
@@ -55,16 +58,16 @@ export const ManageAgentsParameters = Schema.Struct({
       "Target session ID, job ID, or agent name/role (e.g. 'Backend', 'Frontend Lead'). Required for 'kill', 'inspect', 'restart'. For 'kill_all', defaults to current session's swarm.",
   }),
   prompt: Schema.optional(Schema.String).annotate({
-    description: "Optional instruction or guidance to provide when resuming or restarting the agent.",
+    description: "New steering instructions or guidance when restarting the agent mid-flight.",
   }),
 })
 
 export const AskAgentParameters = Schema.Struct({
   target_id: Schema.String.annotate({
-    description: "Target session ID, job ID, or agent name/role (e.g. 'Backend', 'Frontend Lead') to query.",
+    description: "Target session ID, job ID, or agent name/role (e.g. 'Backend', 'Frontend Lead') to inspect.",
   }),
   prompt: Schema.String.annotate({
-    description: "Question or prompt for the agent.",
+    description: "Read-only question for the agent. Tools are disabled on the agent during this query.",
   }),
 })
 
