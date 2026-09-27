@@ -38,6 +38,7 @@ const ASK_AGENT_DESCRIPTION = [
   "READ-ONLY inspection and Q&A with an agent out-of-band without interrupting its running task.",
   "Tools are disabled and this does NOT steer, redirect, or alter running background workers.",
   "To change instructions or steer an already-running worker mid-flight, use manage_agents with action: 'restart' and your new prompt.",
+  "When calling ask_agent, you MUST summarize or quote the returned answer in your response so the user can see what the agent responded.",
 ].join(" ")
 
 export const Parameters = Schema.Struct({
@@ -89,7 +90,8 @@ function elapsed(ms: number) {
   return `${hours}h ${minutes % 60}m`
 }
 
-function preview(text: string) {
+function preview(text?: string) {
+  if (!text) return ""
   const flat = text.replace(/\s+/g, " ").trim()
   return flat.length > 200 ? `${flat.slice(0, 200)}…` : flat
 }
@@ -668,11 +670,31 @@ export const AskAgentTool = Tool.define(
       return yield* Effect.gen(function* () {
         let contextPrefix = ""
         if (targetSession) {
-          const msgs = yield* sessions.messages({ sessionID: targetSession.id, limit: 10 }).pipe(Effect.option)
+          const msgs = yield* sessions.messages({ sessionID: targetSession.id, limit: 15 }).pipe(Effect.option)
           if (Option.isSome(msgs) && msgs.value.length > 0) {
             const history = msgs.value
-              .flatMap((m) => m.parts.filter((p) => p.type === "text").map((p) => `${m.info.role}: ${preview(p.text)}`))
-              .slice(-5)
+              .flatMap((m) =>
+                m.parts.flatMap((p) => {
+                  if (p.type === "text" && p.text?.trim()) {
+                    return [`${m.info.role}: ${preview(p.text)}`]
+                  }
+                  if (p.type === "tool") {
+                    const toolState = p.state
+                    if (toolState?.status === "completed") {
+                      const out = toolState.output ? ` -> ${preview(toolState.output)}` : ""
+                      return [`[Action completed: ${p.tool}${out}]`]
+                    }
+                    if (toolState?.status === "error") {
+                      return [`[Action failed: ${p.tool} -> ${preview(toolState.error)}]`]
+                    }
+                    if (toolState?.status === "running") {
+                      return [`[Action running: ${p.tool}]`]
+                    }
+                  }
+                  return []
+                }),
+              )
+              .slice(-10)
               .join("\n")
             if (history) {
               contextPrefix = `[Context from target agent ${targetSession.agent ?? targetId}]:\n${history}\n\n`
@@ -729,11 +751,25 @@ If answering requires reading files or executing commands, state that it cannot 
           }),
         )
 
-        const answer = Exit.isSuccess(promptExit)
-          ? promptExit.value.parts
-              .flatMap((p: SessionV1.Part) => (p.type === "text" ? [p.text] : []))
-              .join("\n\n") || "No response received."
-          : `[Side-query failed: ${errorMessage(promptExit.cause)}]`
+        let answer = ""
+        if (Exit.isSuccess(promptExit)) {
+          const textParts = promptExit.value.parts.flatMap((p: SessionV1.Part) =>
+            p.type === "text" && p.text?.trim() ? [p.text] : [],
+          )
+          if (textParts.length > 0) {
+            answer = textParts.join("\n\n")
+          } else {
+            const reasoningParts = promptExit.value.parts.flatMap((p: SessionV1.Part) =>
+              p.type === "reasoning" && p.text?.trim() ? [p.text] : [],
+            )
+            answer =
+              reasoningParts.length > 0
+                ? `[Reasoning summary]: ${reasoningParts.join("\n\n")}`
+                : "No text response received from agent."
+          }
+        } else {
+          answer = `[Side-query failed: ${errorMessage(promptExit.cause)}]`
+        }
 
         return {
           title: `Answer from ${agentName}`,
