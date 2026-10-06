@@ -720,4 +720,43 @@ describe("empirical challenger: concurrency & worktree guardrails", () => {
         expect(daemonStatus).toBe("running")
       }),
   )
+
+  it.instance(
+    "background tasks automatically default daemon to true for ESC decoupling",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+
+        const bgResult = yield* def.execute(
+          {
+            description: "test bg default daemon",
+            prompt: "run something",
+            subagent_type: "general",
+            background: true,
+            worktree: false,
+          },
+          taskCtx(chat.id, assistant.id, stubOps({ text: "done" })),
+        )
+
+        expect(bgResult.metadata.daemon).toBe(true)
+
+        const explicitFalse = yield* def.execute(
+          {
+            description: "test explicit false",
+            prompt: "run something",
+            subagent_type: "general",
+            background: true,
+            worktree: false,
+            daemon: false,
+          },
+          taskCtx(chat.id, assistant.id, stubOps({ text: "done" })),
+        )
+
+        expect(explicitFalse.metadata.daemon).toBe(false)
+      }),
+    { git: true },
+  )
 })
+
