@@ -178,7 +178,10 @@ export const TaskTool = Tool.define(
         return yield* Effect.fail(new Error("Worktree mode requires a project instance context"))
       }
       const cfg = yield* config.get()
-      const runInBackground = params.background === true
+      const runInBackground =
+        params.background !== undefined
+          ? params.background
+          : ctx.agent === "Agent-Teams" || ctx.agent.toLowerCase().includes("orchestrator")
 
       const parent = yield* sessions.get(ctx.sessionID)
       let current = parent
