@@ -283,7 +283,7 @@ export const TaskTool = Tool.define(
         sessionId: nextSession.id,
         model,
         ...(runInBackground ? { background: true } : {}),
-        daemon: params.daemon === true,
+        daemon: params.daemon ?? runInBackground,
       }
 
       yield* ctx.metadata({
