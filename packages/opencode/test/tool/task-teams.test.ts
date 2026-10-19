@@ -34,7 +34,6 @@ import { Vcs } from "../../src/project/vcs"
 import { Format } from "../../src/format"
 import { LSP } from "../../src/lsp/lsp"
 import { Project } from "../../src/project/project"
-import { ShareNext } from "../../src/share/share-next"
 import { Snapshot } from "../../src/snapshot"
 import { disposeAllInstances } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -74,7 +73,6 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
       Format.node,
       LSP.node,
       Project.node,
-      ShareNext.node,
       Snapshot.node,
     ]),
     [

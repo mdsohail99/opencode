@@ -34,7 +34,6 @@ import { Vcs } from "../../src/project/vcs"
 import { Format } from "../../src/format"
 import { LSP } from "../../src/lsp/lsp"
 import { Project } from "../../src/project/project"
-import { ShareNext } from "../../src/share/share-next"
 import { Snapshot } from "../../src/snapshot"
 import { disposeAllInstances } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -74,7 +73,6 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
       Format.node,
       LSP.node,
       Project.node,
-      ShareNext.node,
       Snapshot.node,
     ]),
     [
@@ -571,8 +569,11 @@ describe("Adversarial M2 Empirical Challenge Suite", () => {
           )
           .pipe(Effect.exit)
 
-        // Because execute pipes run(params, ctx).pipe(Effect.orDie), a failure becomes a die exit
-        expect(resultExit._tag).toBe("Failure")
+        // Because execute catches prompt failures gracefully, it returns a tool output indicating failure
+        expect(resultExit._tag).toBe("Success")
+        if (resultExit._tag === "Success") {
+          expect(resultExit.value.output).toContain("Side-query failed")
+        }
 
         // Most importantly: EMPIRICALLY VERIFY THE EPHEMERAL SESSION WAS REMOVED FROM SQLITE!
         expect(ephemeralSessionID).toBeDefined()
@@ -609,7 +610,10 @@ describe("Adversarial M2 Empirical Challenge Suite", () => {
           )
           .pipe(Effect.exit)
 
-        expect(exit._tag).toBe("Failure")
+        expect(exit._tag).toBe("Success")
+        if (exit._tag === "Success") {
+          expect(exit.value.output).toContain("Target agent or session 'non-existent-target-session' not found")
+        }
       }),
     )
 
@@ -642,7 +646,10 @@ describe("Adversarial M2 Empirical Challenge Suite", () => {
           )
           .pipe(Effect.exit)
 
-        expect(exit._tag).toBe("Failure")
+        expect(exit._tag).toBe("Success")
+        if (exit._tag === "Success") {
+          expect(exit.value.output).toContain("requires promptOps in execution context")
+        }
       }),
     )
   })
