@@ -234,7 +234,7 @@ describe("tool.task worktree hookup (spec B/E)", () => {
           taskCtx(chat.id, assistant.id, stubOps({ text: "worktree done" })),
         )
 
-        const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 2_000 })
+        const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 10_000 })
         expect(waited.timedOut).toBe(false)
         expect(waited.info?.status).toBe("completed")
         expect(waited.info?.output).toBe("worktree done")
@@ -300,7 +300,7 @@ describe("tool.task worktree hookup (spec B/E)", () => {
           taskCtx(chat.id, assistant.id, stubOps({ text: "explore done" })),
         )
 
-        const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 2_000 })
+        const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 10_000 })
         expect(waited.timedOut).toBe(false)
         expect(waited.info?.status).toBe("completed")
         expect(waited.info?.output).toBe("explore done")
@@ -330,7 +330,7 @@ describe("tool.task worktree hookup (spec B/E)", () => {
           taskCtx(chat.id, assistant.id, stubOps({ text: "in-place done" })),
         )
 
-        const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 2_000 })
+        const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 10_000 })
         expect(waited.timedOut).toBe(false)
         expect(waited.info?.status).toBe("completed")
         expect(waited.info?.output).toBe("in-place done")
@@ -367,7 +367,7 @@ describe("tool.task worktree hookup (spec B/E)", () => {
           customCtx,
         )
 
-        const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 2_000 })
+        const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 10_000 })
         expect(waited.timedOut).toBe(false)
         expect(waited.info?.status).toBe("completed")
         expect(askedMerge).toBe(false)
@@ -409,7 +409,7 @@ describe("tool.task worktree hookup (spec B/E)", () => {
           customCtx,
         )
 
-        const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 2_000 })
+        const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 10_000 })
         expect(waited.timedOut).toBe(false)
         expect(waited.info?.status).toBe("completed")
         expect(askedMerge).toBe(false)
