@@ -407,7 +407,12 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
               fullscreen
               onSelect={(option) => {
                 if (option === "always") {
-                  setStore("stage", "always")
+                  void sdk.client.permission.reply({
+                    reply: "always",
+                    requestID: props.request.id,
+                    directory: props.directory,
+                    workspace: project.workspace.current(),
+                  })
                   return
                 }
                 if (option === "reject") {
@@ -606,6 +611,26 @@ function Prompt<const T extends Record<string, string>>(props: {
         },
       },
       {
+        key: "tab",
+        desc: "Next permission option",
+        group: "Permission",
+        cmd: () => {
+          const idx = keys.indexOf(store.selected)
+          const next = keys[(idx + 1) % keys.length]
+          setStore("selected", next)
+        },
+      },
+      {
+        key: "shift+tab",
+        desc: "Previous permission option",
+        group: "Permission",
+        cmd: () => {
+          const idx = keys.indexOf(store.selected)
+          const next = keys[(idx - 1 + keys.length) % keys.length]
+          setStore("selected", next)
+        },
+      },
+      {
         key: "return",
         desc: "Select permission option",
         group: "Permission",
@@ -682,6 +707,10 @@ function Prompt<const T extends Record<string, string>>(props: {
                 paddingRight={1}
                 backgroundColor={option === store.selected ? theme.warning : theme.backgroundMenu}
                 onMouseOver={() => setStore("selected", option)}
+                onMouseDown={() => {
+                  setStore("selected", option)
+                  props.onSelect(option)
+                }}
                 onMouseUp={() => {
                   setStore("selected", option)
                   props.onSelect(option)
